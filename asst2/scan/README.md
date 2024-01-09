@@ -5,7 +5,7 @@ In this section, following course materials from CMU's parallel computing course
 ## Parallel Exclusive Prefix Sum
 The core of the algorithm is the parallel-exclusive-prefix-sum algorithm, which calculates prefix sum of an array in a parallel manner. 
 
-It is a work efficient algorithm of complexity **O(logN)**
+It is a work efficient algorithm of complexity **O(N)**, on par with the serial version.
 
 ![Alt text](github_images/algo.png)
 
