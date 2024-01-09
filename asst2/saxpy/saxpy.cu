@@ -71,6 +71,61 @@ saxpyCuda(int N, float alpha, float* xarray, float* yarray, float* resultarray) 
     cudaFree(device_x); cudaFree(device_y); cudaFree(device_result);
 }
 
+
+__global__ void
+gemm_kernel(int N, int M, int K, float* result) {
+
+    // compute overall index from position of thread in current block,
+    // and given the block we are in
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    __shared__ float sABlock[N][K];
+    __shared__ float sBBlock[K][M];
+    __shared__ float sCBlock[N][M];
+
+    
+}
+
+#define OUT
+__device__ void
+block_gemm(int blockKDim, float** sABlock, float** sBBlock, OUT float** sCBlock, int threadYDim, int threadXDim){
+    float frag_a[threadYDim], frag_b[threadXDim];
+    float acc[threadYDim][threadXDim];
+    
+    int blockX = 8, blockY = 4, blockTileK = 8;
+
+    int tid = blockDim.x * blockIdx.x + threadIdx.x;
+    if(tid % blockDim.x == 0){
+        //one per block. copy to shared mem
+    }
+    __syncthreads();//wait.
+
+    int warpXInBlock = 4, warpYInBlock = 2;
+    int warpXIdx = (tid >> 5) % warpXInBlock, warpIdxY = (tid >> 5 + warpXInBlock - 1)/warpXInBlock;
+    
+    #pragma unroll
+    for(int fragK = 0; fragK < blockTileK ; fragK++){
+        #pragma unroll
+        for(int fragYIdx = 0; fragYIdx < warpYInBlock; ++fragYIdx){
+            #pragma unroll
+            for(int fragXIdx = 0; fragXIdx < warpXInBlock; ++fragXIdx){
+                warp_gemm(tid, fragYIdx, fragXIdx, sABlock, sBBlock, sCBlock);
+            }
+        }
+    }
+
+}
+
+// this code runs in a single warp!
+// a warp always calculates outer product of 8*1 frag A and 1*4 frag B
+// and fills 8*4 block of C.
+// if tiling to larger spans, run outer loop which tiles into 8*4 sections, 
+// don't need syncs.
+__device__ void warp_gemm(int tid, int fragY, int fragX, float** sA, float** sB, OUT float** sC){
+    //fill in the answers~
+    int r = tid >> 0x08, c = tid & 0x08;
+    sC[r][c] += sA[r][0] * sB[0][c];
+}
+
 void
 printCudaInfo() {
 

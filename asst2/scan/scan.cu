@@ -29,7 +29,133 @@ static inline int nextPow2(int n)
     return n;
 }
 
-//Device code
+//kernel
+
+//shmem impl defines
+#define LOG2_WARP_SIZE 5U
+#define WARP_SIZE (1U << LOG2_WARP_SIZE)
+#define BLOCKSIZE 512
+#define SCAN_BLOCK_DIM   BLOCKSIZE
+#define OUT
+
+// code from NVIDIA
+// https://developer.nvidia.com/gpugems/gpugems3/part-vi-gpu-computing/chapter-39-parallel-prefix-sum-scan-cuda
+// assuming size <= WARP_SIZE
+inline __device__ int
+warp_inclusive_scan(int threadIndex, int idata, volatile int *s_Data, int size){
+    // should know this trick by now..
+    int pos = 2 * threadIndex - (threadIndex & (size - 1));
+    s_Data[pos] = 0;
+    pos += size;
+    s_Data[pos] = idata;
+
+    for(uint offset = 1; offset < size; offset <<= 1)
+        s_Data[pos] += s_Data[pos - offset];
+
+    return s_Data[pos];
+}
+
+//assuming size <= WARP_SIZE
+inline __device__ int warp_exclusive_scan(int threadIndex, int idata, volatile int *sScratch, int size){
+    // Inclusive() - myself(idata)
+    return warp_inclusive_scan(threadIndex, idata, sScratch, size) - idata;
+}
+
+//implementation using above(given) code
+inline __device__ int
+exclusive_scan_shmem(
+    int threadIndex,
+    int* sInput,    //on shared memory
+    OUT int* sOutput,   //on shared memory
+    volatile int* sScratch, //on shared memory
+    int size
+){
+    //no divergence here..
+    if(size > WARP_SIZE){
+        int idata = sInput[threadIndex];
+        //calculate prefix sum within the WARP block. (mod 32)
+        //that is, 
+        // WARP 1
+        //  res[32] = 32:32
+        //  res[33] = 32:33
+        //  ... 
+        //  res[63] = 32:63
+        // WARP 2
+        //  res[64] = 65:64
+        //  res[65] = 64:65
+        //  ...
+        //  res[95] = 64:95
+
+        int warpResult = warp_inclusive_scan(threadIndex, idata, sScratch, WARP_SIZE);
+
+        __syncthreads();
+
+        // save each WARP's exclusive sum compactly to sScratch
+        // sScratch[0] = 0 (starts with all elements 0)
+        // sScratch[1] = 0:31
+        // sScratch[2] = 32:63
+        // ...
+        // sScratch[NUM_WARPS] = 32*(NUM_WARPS-1):32*NUM_WARPS
+        if ((threadIndex & (WARP_SIZE - 1)) == (WARP_SIZE - 1)) 
+            sScratch[threadIndex >> LOG2_WARP_SIZE] = warpResult;
+        
+
+        __syncthreads();
+
+
+        //run prefix sum on above array
+        //if BLOCK has 512 threads, there are 512/32 = 16 warps
+        //for warp0: 0
+        //  warp[1]: 0:31
+        //  warp[2]: 0:63
+        //  warp[3]: 0:95...
+        if(threadIndex < (SCAN_BLOCK_DIM/WARP_SIZE)){
+            int val = sScratch[threadIndex];
+            sScratch[threadIndex] = warp_exclusive_scan(threadIndex, val, sScratch, size >> LOG2_WARP_SIZE);
+        }
+
+        __syncthreads();
+
+        // add 'warp-prefix' + 'within_warp prefix' - me
+        sOutput[threadIndex] = warpResult + sScratch[threadIndex >> LOG2_WARP_SIZE] - idata;
+    
+    } else if (threadIndex < WARP_SIZE) {
+        //threads 0, ... , 31
+        int idata = sInput[threadIndex];
+        sOutput[threadIndex] = warp_exclusive_scan(threadIndex, idata, sScratch, size);
+    }
+}
+
+__global__ void
+exclusive_scan_optimized_kernel(int* device_data, OUT int* device_out, int length){
+    //each thread in the block works on one output,
+    //this is OUT_OF_PLACE operation which fills output..
+    __shared__ int prefixSumInput[BLOCKSIZE];
+    __shared__ int prefixSumOutput[BLOCKSIZE];
+    __shared__ int prefixSumScratch[2 * BLOCKSIZE];
+
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // copy data onto input
+    if(tid < length) prefixSumInput[tid] = device_data[tid];
+
+    // run algo.
+    exclusive_scan_shmem(tid, prefixSumInput, OUT prefixSumOutput, prefixSumScratch, length);
+    
+    // copy result into device_out
+    if(tid < length) OUT device_out[tid] = prefixSumOutput[tid];
+
+}
+
+
+//length can be anything < threadsPerBlock(512 for now)
+void exclusive_scan_optimized(int* device_data, int length)
+{
+    const int threadsPerBlock = nextPow2(length);
+    exclusive_scan_optimized_kernel<<<1, threadsPerBlock>>>(device_data, OUT device_data, threadsPerBlock);
+}
+
+// my implementation
 __global__ void 
 down_sweep_kernel(int* arr, int length, int level){
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -104,8 +230,8 @@ double cudaScan(int* inarray, int* end, int* resultarray)
 
     double startTime = CycleTimer::currentSeconds();
 
-    exclusive_scan(device_data, end - inarray);
-
+    //exclusive_scan(device_data, end - inarray);
+    exclusive_scan_optimized(device_data, end - inarray);
     // Wait for any work left over to be completed.
     cudaThreadSynchronize();
     double endTime = CycleTimer::currentSeconds();
